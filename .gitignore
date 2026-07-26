@@ -1,0 +1,8 @@
+venv/
+work/
+tools/
+models/*.pth
+gfpgan/weights/
+__pycache__/
+*.pyc
+.DS_Store
