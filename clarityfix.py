@@ -54,7 +54,8 @@ def find_realesrgan_bin():
 
 
 def get_pytorch_upsampler():
-    """没有 realesrgan-ncnn-vulkan 时(比如云端 Linux 主机)的纯 PyTorch 兜底实现,CPU 也能跑。"""
+    """没有 realesrgan-ncnn-vulkan 时(比如云端 Linux 主机)的纯 PyTorch 兜底实现,CPU 也能跑。
+    加载耗时(读权重+初始化网络),建议调用方缓存复用。"""
     import torch
     from realesrgan import RealESRGANer
     from realesrgan.archs.srvgg_arch import SRVGGNetCompact
@@ -71,46 +72,66 @@ def get_pytorch_upsampler():
                          tile=0, tile_pad=10, pre_pad=0, half=False, device=device)
 
 
+def get_gfpgan_restorer():
+    """加载 GFPGAN 人脸修复模型(耗时操作:读取约330MB权重+初始化网络)。
+    建议调用方缓存复用,而不是每次处理都重新调用。"""
+    from gfpgan import GFPGANer
+    ensure_model(GFPGAN_URL, MODELS / "GFPGANv1.4.pth")
+    return GFPGANer(model_path=str(MODELS / "GFPGANv1.4.pth"), upscale=1,
+                     arch="clean", channel_multiplier=2, bg_upsampler=None)
+
+
 # ---------- restore (图片画质修复,仅支持单张图片) ----------
 
-def cmd_restore(args):
+DEFAULT_PARAMS = dict(
+    fix_compression=90, improve_detail=70, sharpen=50, reduce_noise=10,
+    dehalo=20, anti_alias=100, add_noise=0, recover_detail=25,
+    face_restore=False, face_strength=80,
+)
+
+
+def restore_image(src, out, params=None, upsampler=None, face_restorer=None):
+    """执行画质修复流水线。
+
+    params: 覆盖 DEFAULT_PARAMS 的参数字典。
+    upsampler / face_restorer: 可选的预加载模型实例(用于预览等需要重复调用的
+        场景,避免每次都重新加载模型);不传时按需临时创建,适合一次性 CLI 调用。
+    """
     import cv2
 
-    src = Path(args.input).resolve()
-    out = Path(args.output).resolve()
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    src = Path(src).resolve()
+    out = Path(out).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    filters = []
-    if args.reduce_noise > 0:
-        s = args.reduce_noise / 100
-        filters.append(f"hqdn3d={12*s:.2f}:{9*s:.2f}:{18*s:.2f}:{13.5*s:.2f}")
-    if args.fix_compression > 0:
-        s = args.fix_compression / 100
-        th = 0.45 * s
-        filters.append(f"deblock=filter=strong:block=8:alpha={th:.3f}:beta={th:.3f}:gamma={th:.3f}:delta={th:.3f}")
-    if args.anti_alias > 0:
-        s = args.anti_alias / 100
-        filters.append(f"unsharp=9:9:{2.8*s:.2f}:9:9:0")
-    if args.recover_detail > 0:
-        s = args.recover_detail / 100
-        filters.append(f"unsharp=5:5:{2.0*s:.2f}:5:5:0")
-    if args.dehalo > 0:
-        s = args.dehalo / 100
-        filters.append(f"smartblur=lr=2.0:ls={0.9*s:.2f}:lt=6.0:cr=0.0:cs=0.0:ct=0.0")
-    if args.sharpen > 0:
-        s = args.sharpen / 100
-        filters.append(f"unsharp=3:3:{3.5*s:.2f}:3:3:0")
-    if args.add_noise > 0:
-        s = args.add_noise / 100
-        filters.append(f"noise=alls={40*s:.1f}:allf=t+u")
+    # 第一步:降噪/去块/去锯齿/恢复细节/去光晕 —— 在 AI 步骤之前做,避免
+    # AI 模型把压缩伪影/噪点误判成"细节"并放大。
+    pre_filters = []
+    if p["reduce_noise"] > 0:
+        s = p["reduce_noise"] / 100
+        pre_filters.append(f"hqdn3d={4*s:.2f}:{3*s:.2f}:{6*s:.2f}:{4.5*s:.2f}")
+    if p["fix_compression"] > 0:
+        s = p["fix_compression"] / 100
+        th = 0.3 * s
+        pre_filters.append(f"deblock=filter=strong:block=8:alpha={th:.3f}:beta={th:.3f}:gamma={th:.3f}:delta={th:.3f}")
+    if p["anti_alias"] > 0:
+        s = p["anti_alias"] / 100
+        pre_filters.append(f"unsharp=9:9:{1.6*s:.2f}:9:9:0")
+    if p["recover_detail"] > 0:
+        s = p["recover_detail"] / 100
+        pre_filters.append(f"unsharp=5:5:{1.3*s:.2f}:5:5:0")
+    if p["dehalo"] > 0:
+        s = p["dehalo"] / 100
+        pre_filters.append(f"smartblur=lr=2.0:ls={0.9*s:.2f}:lt=6.0:cr=0.0:cs=0.0:ct=0.0")
 
     current = out.with_name("_stage_" + out.name)
-    if filters:
-        run(["ffmpeg", "-y", "-i", str(src), "-vf", ",".join(filters), str(current)])
+    if pre_filters:
+        run(["ffmpeg", "-y", "-i", str(src), "-vf", ",".join(pre_filters), "-update", "1", str(current)])
     else:
         shutil.copy(src, current)
 
-    if args.improve_detail > 0:
+    # 第二步:AI 细节增强(超分)
+    if p["improve_detail"] > 0:
         bin_path = find_realesrgan_bin()
         base = cv2.imread(str(current), cv2.IMREAD_COLOR)
         h, w = base.shape[:2]
@@ -122,28 +143,53 @@ def cmd_restore(args):
             sr = cv2.imread(str(sr_out), cv2.IMREAD_COLOR)
             sr_out.unlink(missing_ok=True)
         else:
-            upsampler = get_pytorch_upsampler()
-            sr, _ = upsampler.enhance(base, outscale=2)
+            up = upsampler or get_pytorch_upsampler()
+            sr, _ = up.enhance(base, outscale=2)
         sr_down = cv2.resize(sr, (w, h), interpolation=cv2.INTER_LANCZOS4)
-        alpha = args.improve_detail / 100
+        alpha = p["improve_detail"] / 100
         blended = cv2.addWeighted(sr_down, alpha, base, 1 - alpha, 0)
         cv2.imwrite(str(current), blended)
 
-    if args.face_restore:
-        from gfpgan import GFPGANer
-        ensure_model(GFPGAN_URL, MODELS / "GFPGANv1.4.pth")
-        restorer = GFPGANer(model_path=str(MODELS / "GFPGANv1.4.pth"), upscale=1,
-                             arch="clean", channel_multiplier=2, bg_upsampler=None)
+    # 第三步:锐化 —— 放在超分之后、人脸修复之前。这样能让超分产生的细节
+    # 保留清晰度,同时不会对着 GFPGAN 磨光滑的人脸再做一遍锐化(会把假脸的
+    # 边缘描得更明显、更塑料)。
+    if p["sharpen"] > 0:
+        s = p["sharpen"] / 100
+        sharp_out = out.with_name("_sharp_" + out.name)
+        run(["ffmpeg", "-y", "-i", str(current), "-vf", f"unsharp=3:3:{2.2*s:.2f}:3:3:0",
+             "-update", "1", str(sharp_out)])
+        sharp_out.replace(current)
+
+    # 第四步:人脸修复(放最后,不再被后续滤镜处理)
+    if p["face_restore"]:
+        restorer = face_restorer or get_gfpgan_restorer()
         img = cv2.imread(str(current), cv2.IMREAD_COLOR)
         _, _, restored = restorer.enhance(img, has_aligned=False, only_center_face=False,
                                            paste_back=True)
         if restored is not None:
-            fs = args.face_strength / 100
+            fs = p["face_strength"] / 100
             blended = cv2.addWeighted(restored, fs, img, 1 - fs, 0)
             cv2.imwrite(str(current), blended)
 
-    shutil.move(str(current), str(out))
+    # 第五步:加颗粒 —— 放最后,顺带能盖住人脸修复过于光滑的塑料感。
+    if p["add_noise"] > 0:
+        s = p["add_noise"] / 100
+        run(["ffmpeg", "-y", "-i", str(current), "-vf", f"noise=alls={30*s:.1f}:allf=t+u",
+             "-update", "1", str(out)])
+    else:
+        shutil.move(str(current), str(out))
     print(f"done -> {out}")
+
+
+def cmd_restore(args):
+    params = dict(
+        fix_compression=args.fix_compression, improve_detail=args.improve_detail,
+        sharpen=args.sharpen, reduce_noise=args.reduce_noise, dehalo=args.dehalo,
+        anti_alias=args.anti_alias, add_noise=args.add_noise,
+        recover_detail=args.recover_detail, face_restore=args.face_restore,
+        face_strength=args.face_strength,
+    )
+    restore_image(args.input, args.output, params)
 
 
 def main():
